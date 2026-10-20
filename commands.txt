@@ -1,0 +1,26 @@
+# sanity check on the default L4
+uv run modal run modal_run.py --cmd "nvidia-smi && nsys --version"
+
+# one benchmark run (small model, full train step)
+uv run modal run modal_run.py --gpu H100 --cmd "python -m cs336_systems.benchmarking_script --device cuda --d_model 768 --d_ff 3072 --num_layers 12 --num_heads 12 --mode train"
+
+# all model sizes x all modes in one container
+uv run modal run modal_run.py --gpu H100 --timeout 1800 --cmd '
+for size in "small 768 3072 12 12" "medium 1024 4096 24 16" "large 1280 5120 36 20" "xl 2560 10240 32 32" "10B 4608 12288 50 36"; do
+  set -- $size
+  for mode in forward backward train; do
+    echo "== $1 $mode"
+    python -m cs336_systems.benchmarking_script --device cuda --d_model $2 --d_ff $3 --num_layers $4 --num_heads $5 --mode $mode 2>&1 | grep -E "parameters|mean|std|OutOfMemory" || echo "failed"
+  done
+done'
+
+# local check on CPU with a tiny model
+uv run python -m cs336_systems.benchmarking_script --device cpu --d_model 64 --num_layers 2 --num_heads 4 --d_ff 128 --context_length 32 --mode train
+
+# runs volume
+uv run modal volume ls cs336-a2-runs
+uv run modal volume get cs336-a2-runs <remote_path> <local_path>
+
+# lint and format
+uvx ruff check --fix .
+uvx ruff format .
