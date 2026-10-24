@@ -17,6 +17,13 @@ done'
 # local check on CPU with a tiny model
 uv run python -m cs336_systems.benchmarking_script --device cpu --d_model 64 --num_layers 2 --num_heads 4 --d_ff 128 --context_length 32 --mode train
 
+# nsys profile (small model, train mode) and download the report
+uv run modal run modal_run.py --cmd "mkdir -p runs/nsys && nsys profile --trace=cuda,nvtx,osrt --pytorch=autograd-nvtx --force-overwrite=true -o runs/nsys/small_train python -m cs336_systems.nsys_profile --device cuda --d_model 768 --d_ff 3072 --num_layers 12 --num_heads 12 --mode train --warmup_steps 2 --num_steps 3"
+uv run modal volume get --force cs336-a2-runs nsys/small_train.nsys-rep runs/nsys/small_train.nsys-rep
+
+# Nsight Systems GUI on the Mac
+brew install --cask nvidia-nsight-systems
+
 # runs volume
 uv run modal volume ls cs336-a2-runs
 uv run modal volume get cs336-a2-runs <remote_path> <local_path>
