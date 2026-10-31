@@ -21,6 +21,13 @@ uv run python -m cs336_systems.benchmarking_script --device cpu --d_model 64 --n
 uv run modal run modal_run.py --cmd "mkdir -p runs/nsys && nsys profile --trace=cuda,nvtx,osrt --pytorch=autograd-nvtx --force-overwrite=true -o runs/nsys/small_train python -m cs336_systems.nsys_profile --device cuda --d_model 768 --d_ff 3072 --num_layers 12 --num_heads 12 --mode train --warmup_steps 2 --num_steps 3"
 uv run modal volume get --force cs336-a2-runs nsys/small_train.nsys-rep runs/nsys/small_train.nsys-rep
 
+# gradient checkpointing sweep (xl, ctx 2048, forward + backward), 0 = no checkpointing
+uv run modal run modal_run.py --gpu H100 --timeout 1200 --cmd '
+for k in 1 2 4 8 0; do
+  echo "== xl ctx=2048 backward checkpoint_every=$k"
+  python -m cs336_systems.benchmarking_script --device cuda --d_model 2560 --d_ff 10240 --num_layers 32 --num_heads 32 --context_length 2048 --batch_size 4 --mode backward --warmup_steps 2 --num_steps 3 --checkpoint_every $k 2>&1 | grep -E "parameters|mean time|peak memory|OutOfMemory" || echo "failed"
+done'
+
 # Nsight Systems GUI on the Mac
 brew install --cask nvidia-nsight-systems
 

@@ -6,6 +6,7 @@ import torch
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.nn_utils import cross_entropy
 from cs336_basics.optimizer import AdamW
+from torch.utils.checkpoint import checkpoint
 
 
 def parse_args():
@@ -34,7 +35,26 @@ def parse_args():
     # memory profiling
     parser.add_argument("--memory_snapshot", type=str, default=None, help="save a CUDA memory snapshot of the timed steps to this .pickle path")
 
+    # gradient checkpointing
+    parser.add_argument("--checkpoint_every", type=int, default=0, help="wrap every k transformer layers in one checkpoint (0 = no checkpointing)")
+
     return parser.parse_args()
+
+
+def run_layers(layers: torch.nn.ModuleList, x: torch.Tensor) -> torch.Tensor:
+    for layer in layers:
+        x = layer(x)
+    return x
+
+
+def checkpointed_forward(model: BasicsTransformerLM, inputs: torch.Tensor, checkpoint_every: int) -> torch.Tensor:
+    x = model.token_embeddings(inputs)
+    for start in range(0, len(model.layers), checkpoint_every):
+        segment = model.layers[start : start + checkpoint_every]
+        x = checkpoint(run_layers, segment, x, use_reentrant=False)
+    x = model.ln_final(x)
+    x = model.lm_head(x)
+    return x
 
 
 def main():
@@ -45,6 +65,8 @@ def main():
         raise ValueError("--memory_snapshot needs a cuda device")
     print(f"using device: {device}")
     print(f"using {args.autocast_dtype}")
+    if args.checkpoint_every > 0:
+        print(f"checkpointing every {args.checkpoint_every} layers")
 
     def autocast():
         return torch.autocast(device.type, dtype=torch.bfloat16, enabled=args.autocast_dtype == "bfloat16")
@@ -83,7 +105,10 @@ def main():
             model.zero_grad(set_to_none=True)
 
         with autocast():
-            logits = model(inputs)
+            if args.checkpoint_every > 0:
+                logits = checkpointed_forward(model, inputs, args.checkpoint_every)
+            else:
+                logits = model(inputs)
             if args.mode != "forward":
                 loss = cross_entropy(logits.float(), targets)
 

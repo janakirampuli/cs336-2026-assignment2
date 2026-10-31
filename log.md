@@ -179,3 +179,31 @@ At context 2048, the activations take almost all of the memory. Going from 128 t
 bf16 only saves memory when activations take most of the memory, and it saves less than half. At context 128 it saves nothing, because the weights, gradients, and AdamW states stay fp32. At context 2048 it saves about a quarter. Autocast likely still keeps some activations in fp32, like the attention tables inside the softmax, since exp and sum run in fp32 under autocast.
 
 The forward runs keep autograd on, so their peaks include the values saved for a backward pass that never runs. A forward pass inside `torch.no_grad()` would need much less memory.
+
+## Gradient checkpointing (3)
+
+### What one block saves
+
+One block of our model saves 10 tensors the size of the hidden state, 5 tensors the size of the feed forward layer, and 2 attention tables for its backward pass. We counted them with the saved tensor hooks from the handout. For xl at batch 4 and context 2048 in fp32, that is about 6.3 GiB per block, and the 2 attention tables alone are 4 GiB of it. The block's input, which is all a checkpoint keeps, is only 80 MiB.
+
+### Recursive checkpointing on a toy model (problem a)
+
+Splitting the blocks in half again and again keeps the gradients exactly the same as a plain run, and each block reruns its forward pass once per level of splitting. With 8 small blocks and early stopping turned off, every block ran its forward pass 4 times, which is log₂(8) + 1. With PyTorch's default early stopping, the counts were 4, 3, 3, 2 in each half, because a recomputed group stops as soon as it has rebuilt the inputs of its inner checkpoints.
+
+### Segment size on xl (problem b)
+
+Checkpointing every single block gives the lowest peak, because a checkpoint costs about 80 times less than a block of residuals. We ran xl at context 2048 and batch 4 in fp32, with forward and backward but no optimizer step, and put every k layers inside one checkpoint.
+
+| Layers per checkpoint | Checkpoints | Predicted activations | Measured peak | Step time |
+|---|---|---|---|---|
+| 1 | 32 | 9 GiB | 38 GiB | 6.4 s |
+| 2 | 16 | 14 GiB | 44 GiB | 6.5 s |
+| 4 | 8 | 26 GiB | 56 GiB | 6.6 s |
+| 8 | 4 | 51 GiB | out of memory | |
+| no checkpointing | 0 | 203 GiB | out of memory | |
+
+The prediction is the stored checkpoints plus one recomputed group of k blocks, which is (32 / k) × 80 MiB + k × 6.3 GiB. Setting both parts equal gives a best group size of about 0.6 blocks, so 1 is the best size we can use. The measured gaps match the prediction well. Going from 1 to 2 layers per checkpoint added 6 GiB against a predicted 5 GiB, and going from 1 to 4 added 18 GiB against a predicted 17 GiB.
+
+The measured peaks sit about 29 GiB above the predicted activations. Most of that is the weights and gradients, which take about 25 GiB for 3.4B parameters in fp32. The rest is the logits and loss buffers, plus attention tables that exist for a short time while a block is recomputed.
+
+The step time barely changes with the group size, because every block reruns its forward pass exactly once no matter how the blocks are grouped. Without checkpointing, xl does not fit at context 2048 even without the AdamW state, so checkpointing is the only way to run it here.
