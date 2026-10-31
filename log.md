@@ -156,3 +156,26 @@ The H100 has special hardware for bf16 matrix multiplies, called tensor cores, w
 The optimizer step does not get faster at all, because autocast only covers the forward pass, and AdamW still updates fp32 weights. For xl, the optimizer goes from about 13% of the train step in fp32 to about 40% in bf16, so it becomes the next thing worth speeding up.
 
 The 10B model still runs out of memory in the forward pass, at about 78 GiB used. The fp32 weights take about 48 GiB, and autocast keeps a bf16 copy of each weight during the forward pass, which adds about 24 GiB more.
+
+## Memory profiling (2.1.6)
+
+We used the small model instead of xl, because xl does not fit a context of 2048. Each run recorded 2 steps after 2 warmup steps. The snapshots are in `runs/memory/` and open at pytorch.org/memory_viz.
+
+### Peak memory (problems b and c)
+
+GPU memory holds two kinds of things. The first kind stays the same size no matter the context length, and it is the weights plus, for training, the gradients and the two AdamW state tensors. The second kind is the activations, which are the values the forward pass saves for the backward pass, and they grow with the context length.
+
+| Context | Mode | fp32 peak | bf16 peak |
+|---|---|---|---|
+| 128 | forward | 1.2 GiB | 1.2 GiB |
+| 128 | train | 2.2 GiB | 2.3 GiB |
+| 2048 | forward | 28 GiB | 20 GiB |
+| 2048 | train | 31 GiB | 24 GiB |
+
+At context 128, the fixed part takes most of the memory. The small model's weights take about 0.5 GiB in fp32, and weights, gradients, and the two AdamW states together take about 2 GiB, which is most of the 2.2 GiB train peak.
+
+At context 2048, the activations take almost all of the memory. Going from 128 to 2048 tokens is 16 times more tokens, but the forward peak grows about 24 times, because each layer's attention table grows with the square of the context.
+
+bf16 only saves memory when activations take most of the memory, and it saves less than half. At context 128 it saves nothing, because the weights, gradients, and AdamW states stay fp32. At context 2048 it saves about a quarter. Autocast likely still keeps some activations in fp32, like the attention tables inside the softmax, since exp and sum run in fp32 under autocast.
+
+The forward runs keep autograd on, so their peaks include the values saved for a backward pass that never runs. A forward pass inside `torch.no_grad()` would need much less memory.

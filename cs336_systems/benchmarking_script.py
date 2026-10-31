@@ -31,6 +31,9 @@ def parse_args():
     # mixed precision
     parser.add_argument("--autocast_dtype", type=str, default="float32", choices=["float32", "bfloat16"], help="compute precision")
 
+    # memory profiling
+    parser.add_argument("--memory_snapshot", type=str, default=None, help="save a CUDA memory snapshot of the timed steps to this .pickle path")
+
     return parser.parse_args()
 
 
@@ -38,6 +41,8 @@ def main():
     args = parse_args()
 
     device = torch.device(args.device)
+    if args.memory_snapshot and device.type != "cuda":
+        raise ValueError("--memory_snapshot needs a cuda device")
     print(f"using device: {device}")
     print(f"using {args.autocast_dtype}")
 
@@ -99,11 +104,21 @@ def main():
     print("benchmarking...")
     step_times = []
 
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    if args.memory_snapshot:
+        torch.cuda.memory._record_memory_history(max_entries=1_000_000)
+
     for _ in range(args.num_steps):
         start_time = timeit.default_timer()
         run_step()
         end_time = timeit.default_timer()
         step_times.append(end_time - start_time)
+
+    if args.memory_snapshot:
+        torch.cuda.memory._dump_snapshot(args.memory_snapshot)
+        torch.cuda.memory._record_memory_history(enabled=None)
+        print(f"saved memory snapshot to {args.memory_snapshot}")
 
     step_times = np.array(step_times)
     mean_time = np.mean(step_times)
@@ -112,6 +127,8 @@ def main():
     print(f"results ({args.mode}):")
     print(f"mean time: {mean_time * 1000:.2f} ms")
     print(f"std dev: {std_time * 1000:.2f} ms")
+    if device.type == "cuda":
+        print(f"peak memory: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GiB")
 
 
 if __name__ == "__main__":
