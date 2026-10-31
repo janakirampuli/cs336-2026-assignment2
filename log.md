@@ -207,3 +207,62 @@ The prediction is the stored checkpoints plus one recomputed group of k blocks, 
 The measured peaks sit about 29 GiB above the predicted activations. Most of that is the weights and gradients, which take about 25 GiB for 3.4B parameters in fp32. The rest is the logits and loss buffers, plus attention tables that exist for a short time while a block is recomputed.
 
 The step time barely changes with the group size, because every block reruns its forward pass exactly once no matter how the blocks are grouped. Without checkpointing, xl does not fit at context 2048 even without the AdamW state, so checkpointing is the only way to run it here.
+
+## Attention on its own (4.1.1)
+
+### Time and memory by sequence length and head size (pytorch_attention a)
+
+The attention tables decide both the time and the memory, so the sequence length matters and the head size barely does. We timed the staff attention function alone in fp32 with batch 8 and no head dimension, averaging 100 forward and 100 backward passes on the H100.
+
+| Sequence length | Forward (d = 16 to 128) | Backward (d = 16 to 128) | Memory before backward |
+|---|---|---|---|
+| 256 | 0.11 ms | 0.35 to 0.38 ms | 0.07 GiB |
+| 1,024 | 0.22 to 0.29 ms | 0.62 to 0.72 ms | 0.13 to 0.14 GiB |
+| 4,096 | 2.6 to 3.5 ms | 6.2 to 8.1 ms | 1.1 GiB |
+| 8,192 | 10 to 14 ms | 24 to 31 ms | 4.1 to 4.2 GiB |
+| 16,384 | 39 to 55 ms | 95 to 124 ms | 16.1 to 16.4 GiB |
+
+Nothing ran out of memory on the 80 GB H100, even at 16,384 tokens.
+
+The memory before the backward pass is the two saved attention tables. One table at batch 8 and 16,384 tokens is 8 × 16,384 × 16,384 × 4 bytes = 8 GiB, and two tables make 16 GiB, which matches the measurement to within 0.4 GiB. Q, K, V, and the output take only 8 to 64 MiB each. Every time the sequence length doubles, the memory grows about 4 times, because each table grows with the square of the sequence length.
+
+The time also grows about 4 times per doubling once the sequence is long, for the same reason. At 256 and 1,024 tokens the work is so small that the time is mostly the cost of launching kernels. Going from d = 16 to d = 128 adds only about 40% at 16,384 tokens, even though Q, K, and V get 8 times bigger, because most of the time goes to reading and writing the tables in the softmax and the masking.
+
+The backward pass takes about 2.4 times as long as the forward pass, since it has two matrix multiplies for each one in the forward pass and makes several more passes over the tables.
+
+### Where it would run out of memory (worked out, not run)
+
+The first size that should run out of memory on the 80 GB H100 is 32,768 tokens, and it should fail in the forward pass, before anything is saved for the backward pass. One table at that length is 8 × 32,768 × 32,768 × 4 bytes = 32 GiB, which is 4 times the 8 GiB at 16,384 tokens.
+
+The forward pass keeps several tables alive at the same moment. Inside the softmax, the scaled scores, the scores minus the row max, and the result of exp all exist together, which is 3 tables or 96 GiB. That is already more than the GPU holds. At 16,384 tokens the same moment needs 3 × 8 = 24 GiB, and the largest moment, when the division by the row sum makes a fourth table, needs 32 GiB, so it fits. Even if the forward pass got through, the two saved tables at 32,768 tokens would take 64 GiB before the backward pass starts.
+
+### Compiled attention (torch_compile a)
+
+`torch.compile` makes attention 2 to 3 times faster at long sequences but saves no memory. We ran the same sweep with `torch.compile(scaled_dot_product_attention)`, compiling fresh for each shape and leaving compile time out of the timings. The table shows the uncompiled time, then the compiled time, for the smallest and largest head sizes.
+
+| Sequence length | Forward, d = 16 | Forward, d = 128 | Backward, d = 16 | Backward, d = 128 |
+|---|---|---|---|---|
+| 256 | 0.15 to 0.15 ms | 0.15 to 0.14 ms | 0.45 to 0.36 ms | 0.49 to 0.34 ms |
+| 1,024 | 0.23 to 0.15 ms | 0.30 to 0.22 ms | 0.64 to 0.41 ms | 0.75 to 0.53 ms |
+| 4,096 | 2.6 to 1.0 ms (2.7x) | 3.6 to 1.9 ms (1.8x) | 6.2 to 2.6 ms (2.4x) | 8.1 to 4.4 ms (1.8x) |
+| 8,192 | 10 to 3.4 ms (2.9x) | 14 to 7.3 ms (1.9x) | 24 to 9.8 ms (2.5x) | 31 to 17 ms (1.8x) |
+| 16,384 | 39 to 14 ms (2.9x) | 55 to 30 ms (1.9x) | 95 to 38 ms (2.5x) | 124 to 67 ms (1.8x) |
+
+The compiled version joins the scaling, the softmax steps, and their backward steps into a few kernels, so it reads and writes each attention table fewer times. Those passes over the tables are most of the time, so the speedup is biggest at long sequences. It is also bigger for d = 16 than for d = 128, because with a small head size almost all the time is those passes, while with a large head size more of the time is the matrix multiplies, which compiling does not speed up.
+
+The memory before the backward pass is the same with and without compiling, about 16.5 GiB at 16,384 tokens. The compiled version still keeps two full attention tables for the backward pass, so it would run out of memory at the same sequence length. Getting rid of the tables needs a kernel that never writes them out in full, which is what FlashAttention does.
+
+### Compiled model (torch_compile b)
+
+Compiling the whole model helps much less than compiling attention alone, and it helps the small model most. We ran each size with and without `torch.compile(model)` at context 512 in fp32, with the same settings as the timing runs in 2.1.3. The table shows the uncompiled time, then the compiled time.
+
+| Size | Forward | Forward and backward | Train step |
+|---|---|---|---|
+| small | 22 to 15 ms (1.4x) | 64 to 47 ms (1.35x) | 73 to 57 ms (1.3x) |
+| medium | 56 to 44 ms (1.3x) | 174 to 134 ms (1.3x) | 197 to 157 ms (1.25x) |
+| large | 125 to 104 ms (1.2x) | 391 to 322 ms (1.2x) | 440 to 372 ms (1.2x) |
+| xl | 339 to 306 ms (1.1x) | 1,078 to 979 ms (1.1x) | 1,247 to 1,143 ms (1.1x) |
+
+Compiling joins the small operations, like the norms, the softmax, SiLU, RoPE, and the residual adds, into fewer kernels, but it leaves the matrix multiplies as they are. At context 512 the attention tables are small, so most of the time already goes to matrix multiplies, and the gain is much smaller than the 2 to 3 times we saw for attention at long sequences. Bigger models spend an even larger share of their time in matrix multiplies, so the gain falls from about 1.4 times for small to about 1.1 times for xl.
+
+The optimizer step takes the same time with and without compiling, about 10 ms for small and 165 ms for xl, because only the model is compiled and AdamW still runs as many small separate operations.

@@ -38,6 +38,9 @@ def parse_args():
     # gradient checkpointing
     parser.add_argument("--checkpoint_every", type=int, default=0, help="wrap every k transformer layers in one checkpoint (0 = no checkpointing)")
 
+    # torch.compile
+    parser.add_argument("--compile", action="store_true", help="run the model through torch.compile")
+
     return parser.parse_args()
 
 
@@ -63,10 +66,14 @@ def main():
     device = torch.device(args.device)
     if args.memory_snapshot and device.type != "cuda":
         raise ValueError("--memory_snapshot needs a cuda device")
+    if args.compile and args.checkpoint_every > 0:
+        raise ValueError("--compile and --checkpoint_every can't be combined")
     print(f"using device: {device}")
     print(f"using {args.autocast_dtype}")
     if args.checkpoint_every > 0:
         print(f"checkpointing every {args.checkpoint_every} layers")
+    if args.compile:
+        print("using torch.compile")
 
     def autocast():
         return torch.autocast(device.type, dtype=torch.bfloat16, enabled=args.autocast_dtype == "bfloat16")
@@ -87,6 +94,9 @@ def main():
     model.train()
 
     print(f"model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.3f}M")
+
+    if args.compile:
+        model = torch.compile(model)
 
     inputs = torch.randint(0, args.vocab_size, (args.batch_size, args.context_length), device=device)
     targets = torch.randint(0, args.vocab_size, (args.batch_size, args.context_length), device=device)
